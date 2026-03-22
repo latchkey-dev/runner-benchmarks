@@ -32,14 +32,16 @@ jobs:
       - name: Measure startup latency
         id: latency
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
           # Get this job's queued and started timestamps from the API
-          JOB_DATA=$(gh api \
-            "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
-            --jq '.jobs[] | select(.name == "Startup Latency") | {created_at: .created_at, started_at: .started_at}')
+          JOB_DATA=$(curl -s \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
+            | jq '.jobs[] | select(.name | endswith("Startup Latency")) | {created_at: .created_at, started_at: .started_at}')
 
           CREATED_AT=$(echo "$JOB_DATA" | jq -r '.created_at')
           STARTED_AT=$(echo "$JOB_DATA" | jq -r '.started_at')
@@ -116,7 +118,7 @@ jobs:
 
       - name: Verify and summarize
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -139,9 +141,11 @@ jobs:
           fi
 
           # Get accurate step durations from the GitHub API
-          STEPS_JSON=$(gh api \
-            "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
-            --jq '.jobs[] | select(.name == "Cache Throughput") | .steps')
+          STEPS_JSON=$(curl -s \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
+            | jq '.jobs[] | select(.name | endswith("Cache Throughput")) | .steps')
 
           SAVE_STARTED=$(echo "$STEPS_JSON" | jq -r '.[] | select(.name == "Save cache") | .started_at')
           SAVE_COMPLETED=$(echo "$STEPS_JSON" | jq -r '.[] | select(.name == "Save cache") | .completed_at')
@@ -208,8 +212,11 @@ jobs:
     name: Docker Layer Cache
     runs-on: [self-hosted, "${{ inputs.runner_label || 'latchkey-medium' }}"]
     steps:
-      - name: Checkout
+      - name: Checkout benchmark files
         uses: actions/checkout@v4
+        with:
+          repository: latchkey-dev/runner-benchmarks
+          ref: v1.0.0
 
       - name: Build uncached (first build populates ECR cache)
         id: build-uncached
