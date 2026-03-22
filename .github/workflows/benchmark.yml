@@ -26,6 +26,81 @@ permissions:
 
 jobs:
   # =========================================================================
+  # Job 0: Runner Diagnostics
+  # =========================================================================
+  diagnostics:
+    name: Runner Diagnostics
+    runs-on: [self-hosted, "${{ inputs.runner_label || 'latchkey-medium' }}"]
+    steps:
+      - name: Environment variables
+        run: |
+          echo "### Runner Diagnostics" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "#### Environment" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Variable | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ACTIONS_CACHE_URL | ${ACTIONS_CACHE_URL:-NOT SET} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ECR_CACHE_REPO | ${ECR_CACHE_REPO:-NOT SET} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| RUNNER_NAME | ${RUNNER_NAME:-unknown} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| RUNNER_OS | ${RUNNER_OS:-unknown} |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Instance metadata
+        run: |
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+          INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+          INSTANCE_TYPE=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-type)
+          AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+
+          echo "#### Instance" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Info | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Instance ID | $INSTANCE_ID |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Instance type | $INSTANCE_TYPE |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| AZ | $AZ |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cache proxy diagnostics
+        run: |
+          echo "#### Cache Proxy" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          echo "--- Binary ---"  >> "$GITHUB_STEP_SUMMARY"
+          ls -la /opt/cache-proxy/ >> "$GITHUB_STEP_SUMMARY" 2>&1 || echo "Directory not found" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "--- Env file ---" >> "$GITHUB_STEP_SUMMARY"
+          cat /opt/cache-proxy/env >> "$GITHUB_STEP_SUMMARY" 2>&1 || echo "Env file not found" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "--- Systemd status ---" >> "$GITHUB_STEP_SUMMARY"
+          systemctl status cache-proxy --no-pager >> "$GITHUB_STEP_SUMMARY" 2>&1 || echo "Service not running" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "--- Journal logs (last 30 lines) ---" >> "$GITHUB_STEP_SUMMARY"
+          sudo journalctl -u cache-proxy --no-pager -n 30 >> "$GITHUB_STEP_SUMMARY" 2>&1 || echo "No journal entries" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "--- Healthz check ---" >> "$GITHUB_STEP_SUMMARY"
+          curl -s http://localhost:8080/healthz >> "$GITHUB_STEP_SUMMARY" 2>&1 || echo "Healthz failed" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "--- Runner .env ---" >> "$GITHUB_STEP_SUMMARY"
+          cat /opt/actions-runner/.env >> "$GITHUB_STEP_SUMMARY" 2>&1 || echo ".env not found" >> "$GITHUB_STEP_SUMMARY"
+
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Installed tools
+        run: |
+          echo "#### Tools" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tool | Version |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|---------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Docker | $(docker --version 2>&1) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Node | $(node --version 2>&1) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Python | $(python3 --version 2>&1) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Go | $(go version 2>&1 | cut -d' ' -f3) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| AWS CLI | $(aws --version 2>&1) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ECR helper | $(test -f /usr/local/bin/docker-credential-ecr-login && echo 'installed' || echo 'missing') |" >> "$GITHUB_STEP_SUMMARY"
+
+  # =========================================================================
   # Job 1: Startup Latency
   # =========================================================================
   startup-latency:
