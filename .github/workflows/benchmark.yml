@@ -294,7 +294,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: latchkey-dev/runner-benchmarks
-          ref: v1.0.0
+          ref: main
 
       - name: Build uncached (first build populates ECR cache)
         id: build-uncached
@@ -313,8 +313,19 @@ jobs:
           echo "Uncached build: ${DURATION}s"
           echo "duration=${DURATION}" >> "$GITHUB_OUTPUT"
 
+      - name: Check ECR cache availability
+        id: ecr-check
+        run: |
+          if [ -n "${ECR_CACHE_REPO:-}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "ECR_CACHE_REPO is set: ${ECR_CACHE_REPO}"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "ECR_CACHE_REPO is not set — push step will be skipped"
+          fi
+
       - name: Push layers to ECR cache
-        if: env.ECR_CACHE_REPO != ''
+        if: steps.ecr-check.outputs.available == 'true'
         uses: latchkey-dev/docker-cache-action@v1
         with:
           context: .
