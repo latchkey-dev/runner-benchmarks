@@ -13,6 +13,13 @@ on:
           - latchkey-medium
           - latchkey-large
           - latchkey-xlarge
+  workflow_call:
+    inputs:
+      runner_label:
+        description: 'Runner label to benchmark'
+        required: false
+        default: 'latchkey-medium'
+        type: string
 
 jobs:
   # =========================================================================
