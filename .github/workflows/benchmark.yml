@@ -71,6 +71,7 @@ jobs:
     runs-on: [self-hosted, "${{ inputs.runner_label || 'latchkey-medium' }}"]
     steps:
       - name: Generate 500MB test data
+        id: generate
         run: |
           mkdir -p test-cache
           dd if=/dev/urandom of=test-cache/payload.bin bs=1M count=500 status=progress
@@ -78,22 +79,14 @@ jobs:
           CHECKSUM=$(sha256sum test-cache/payload.bin | cut -d' ' -f1)
           echo "checksum=${CHECKSUM}" >> "$GITHUB_OUTPUT"
           echo "Generated 500MB payload, SHA256: ${CHECKSUM}"
-        id: generate
 
-      - name: Save cache (measure throughput)
-        id: cache-save
+      - name: Report cache backend
         run: |
-          START=$(date +%s%N)
-
-          # Use actions/cache CLI if available, otherwise fall back to API
           if [ -n "${ACTIONS_CACHE_URL:-}" ]; then
             echo "Cache URL: ${ACTIONS_CACHE_URL} (Latchkey S3 cache proxy)"
           else
             echo "Cache URL: GitHub default"
           fi
-        # Save timing start for post-step calculation
-        env:
-          SAVE_START: ${{ steps.cache-save.outputs.save_start }}
 
       - name: Save cache
         uses: actions/cache/save@v4
@@ -102,23 +95,10 @@ jobs:
           path: test-cache
           key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Record save time
-        id: save-time
-        run: |
-          # The cache save happened in the previous step
-          # We measure by checking the step duration from the API
-          echo "Cache save completed"
-          echo "save_completed=true" >> "$GITHUB_OUTPUT"
-
       - name: Clear local data
         run: |
           rm -rf test-cache
           echo "Local cache data cleared"
-
-      - name: Restore cache (measure throughput)
-        id: restore-start
-        run: |
-          echo "start_ns=$(date +%s%N)" >> "$GITHUB_OUTPUT"
 
       - name: Restore cache
         uses: actions/cache/restore@v4
@@ -127,61 +107,92 @@ jobs:
           path: test-cache
           key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Measure restore throughput
-        id: restore-measure
+      - name: Verify and summarize
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          END_NS=$(date +%s%N)
-          START_NS=${{ steps.restore-start.outputs.start_ns }}
+          set -euo pipefail
 
           # Verify data integrity
-          if [ -f test-cache/payload.bin ]; then
-            SIZE_BYTES=$(stat -c%s test-cache/payload.bin)
-            SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
-            RESTORED_CHECKSUM=$(sha256sum test-cache/payload.bin | cut -d' ' -f1)
-            ORIGINAL_CHECKSUM=${{ steps.generate.outputs.checksum }}
-
-            if [ "$RESTORED_CHECKSUM" = "$ORIGINAL_CHECKSUM" ]; then
-              echo "Integrity: PASS (checksums match)"
-            else
-              echo "Integrity: FAIL (checksum mismatch)"
-            fi
-
-            # Calculate restore throughput
-            DURATION_NS=$((END_NS - START_NS))
-            DURATION_MS=$((DURATION_NS / 1000000))
-            if [ "$DURATION_MS" -gt 0 ]; then
-              THROUGHPUT_MBPS=$((SIZE_MB * 1000 / DURATION_MS))
-            else
-              THROUGHPUT_MBPS=0
-            fi
-
-            echo "Restored ${SIZE_MB}MB in ${DURATION_MS}ms (${THROUGHPUT_MBPS} MiB/s)"
-            echo "restore_throughput=${THROUGHPUT_MBPS}" >> "$GITHUB_OUTPUT"
-            echo "restore_duration_ms=${DURATION_MS}" >> "$GITHUB_OUTPUT"
-            echo "size_mb=${SIZE_MB}" >> "$GITHUB_OUTPUT"
-          else
-            echo "ERROR: Cache restore failed — file not found"
-            echo "restore_throughput=0" >> "$GITHUB_OUTPUT"
+          if [ ! -f test-cache/payload.bin ]; then
+            echo "### S3 Cache Throughput" >> "$GITHUB_STEP_SUMMARY"
+            echo "Result: FAIL (cache restore produced no file)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
 
-      - name: Cache throughput summary
-        run: |
+          SIZE_BYTES=$(stat -c%s test-cache/payload.bin)
+          SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
+          RESTORED_CHECKSUM=$(sha256sum test-cache/payload.bin | cut -d' ' -f1)
+          ORIGINAL_CHECKSUM="${{ steps.generate.outputs.checksum }}"
+
+          if [ "$RESTORED_CHECKSUM" = "$ORIGINAL_CHECKSUM" ]; then
+            INTEGRITY="PASS"
+          else
+            INTEGRITY="FAIL (checksum mismatch)"
+          fi
+
+          # Get accurate step durations from the GitHub API
+          STEPS_JSON=$(gh api \
+            "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
+            --jq '.jobs[] | select(.name == "Cache Throughput") | .steps')
+
+          SAVE_STARTED=$(echo "$STEPS_JSON" | jq -r '.[] | select(.name == "Save cache") | .started_at')
+          SAVE_COMPLETED=$(echo "$STEPS_JSON" | jq -r '.[] | select(.name == "Save cache") | .completed_at')
+          RESTORE_STARTED=$(echo "$STEPS_JSON" | jq -r '.[] | select(.name == "Restore cache") | .started_at')
+          RESTORE_COMPLETED=$(echo "$STEPS_JSON" | jq -r '.[] | select(.name == "Restore cache") | .completed_at')
+
+          SAVE_DURATION=$(($(date -d "$SAVE_COMPLETED" +%s) - $(date -d "$SAVE_STARTED" +%s)))
+          RESTORE_DURATION=$(($(date -d "$RESTORE_COMPLETED" +%s) - $(date -d "$RESTORE_STARTED" +%s)))
+
+          # Compute throughput (MiB/s) — if step completed in <1s, report at least SIZE_MB
+          if [ "$SAVE_DURATION" -gt 0 ]; then
+            SAVE_THROUGHPUT=$((SIZE_MB / SAVE_DURATION))
+          else
+            SAVE_THROUGHPUT=$SIZE_MB
+          fi
+
+          if [ "$RESTORE_DURATION" -gt 0 ]; then
+            RESTORE_THROUGHPUT=$((SIZE_MB / RESTORE_DURATION))
+          else
+            RESTORE_THROUGHPUT=$SIZE_MB
+          fi
+
+          echo "Save: ${SIZE_MB}MB in ${SAVE_DURATION}s (${SAVE_THROUGHPUT} MiB/s)"
+          echo "Restore: ${SIZE_MB}MB in ${RESTORE_DURATION}s (${RESTORE_THROUGHPUT} MiB/s)"
+
+          # Build summary
           echo "### S3 Cache Throughput" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Payload size | ${{ steps.restore-measure.outputs.size_mb }} MB |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Restore throughput | ${{ steps.restore-measure.outputs.restore_throughput }} MiB/s |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Restore duration | ${{ steps.restore-measure.outputs.restore_duration_ms }} ms |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Payload size | ${SIZE_MB} MB |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Data integrity | ${INTEGRITY} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Save duration | ${SAVE_DURATION}s |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Save throughput | ${SAVE_THROUGHPUT} MiB/s |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Restore duration | ${RESTORE_DURATION}s |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Restore throughput | ${RESTORE_THROUGHPUT} MiB/s |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Cache backend | ${ACTIONS_CACHE_URL:-GitHub default} |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
-          THROUGHPUT=${{ steps.restore-measure.outputs.restore_throughput }}
-          if [ "${THROUGHPUT:-0}" -ge 500 ]; then
-            echo "Result: PASS (target: >500 MiB/s)" >> "$GITHUB_STEP_SUMMARY"
+          RESULT="PASS"
+          if [ "$SAVE_THROUGHPUT" -lt 500 ]; then
+            echo "- Save: BELOW TARGET (target: >500 MiB/s, got: ${SAVE_THROUGHPUT} MiB/s)" >> "$GITHUB_STEP_SUMMARY"
+            RESULT="BELOW TARGET"
           else
-            echo "Result: BELOW TARGET (target: >500 MiB/s, got: ${THROUGHPUT:-0} MiB/s)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Save: PASS (target: >500 MiB/s)" >> "$GITHUB_STEP_SUMMARY"
           fi
+
+          if [ "$RESTORE_THROUGHPUT" -lt 500 ]; then
+            echo "- Restore: BELOW TARGET (target: >500 MiB/s, got: ${RESTORE_THROUGHPUT} MiB/s)" >> "$GITHUB_STEP_SUMMARY"
+            RESULT="BELOW TARGET"
+          else
+            echo "- Restore: PASS (target: >500 MiB/s)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Result: ${RESULT}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "_Durations from GitHub API step timestamps (second precision)._" >> "$GITHUB_STEP_SUMMARY"
 
   # =========================================================================
   # Job 3: Docker Layer Cache
