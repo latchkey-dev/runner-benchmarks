@@ -21,6 +21,9 @@ on:
         default: 'latchkey-medium'
         type: string
 
+permissions:
+  actions: read
+
 jobs:
   # =========================================================================
   # Job 1: Startup Latency
