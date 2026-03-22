@@ -175,6 +175,10 @@ jobs:
             echo "Cache URL: GitHub default"
           fi
 
+      - name: Start save timer
+        id: save-start
+        run: echo "ns=$(date +%s%N)" >> "$GITHUB_OUTPUT"
+
       - name: Save cache
         uses: actions/cache/save@v4
         id: save
@@ -182,10 +186,18 @@ jobs:
           path: test-cache
           key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}
 
+      - name: Stop save timer
+        id: save-end
+        run: echo "ns=$(date +%s%N)" >> "$GITHUB_OUTPUT"
+
       - name: Clear local data
         run: |
           rm -rf test-cache
           echo "Local cache data cleared"
+
+      - name: Start restore timer
+        id: restore-start
+        run: echo "ns=$(date +%s%N)" >> "$GITHUB_OUTPUT"
 
       - name: Restore cache
         uses: actions/cache/restore@v4
@@ -194,9 +206,11 @@ jobs:
           path: test-cache
           key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}
 
+      - name: Stop restore timer
+        id: restore-end
+        run: echo "ns=$(date +%s%N)" >> "$GITHUB_OUTPUT"
+
       - name: Verify and summarize
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -218,36 +232,31 @@ jobs:
             INTEGRITY="FAIL (checksum mismatch)"
           fi
 
-          # Get accurate step durations from the GitHub API
-          STEPS_JSON=$(curl -s \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
-            | jq '.jobs[] | select(.name | endswith("Cache Throughput")) | .steps')
+          # Wall-clock timing with millisecond precision (nanosecond timestamps)
+          SAVE_NS=$(( ${{ steps.save-end.outputs.ns }} - ${{ steps.save-start.outputs.ns }} ))
+          RESTORE_NS=$(( ${{ steps.restore-end.outputs.ns }} - ${{ steps.restore-start.outputs.ns }} ))
+          SAVE_MS=$((SAVE_NS / 1000000))
+          RESTORE_MS=$((RESTORE_NS / 1000000))
 
-          SAVE_STARTED=$(echo "$STEPS_JSON" | jq -r '.[] | select(.name == "Save cache") | .started_at')
-          SAVE_COMPLETED=$(echo "$STEPS_JSON" | jq -r '.[] | select(.name == "Save cache") | .completed_at')
-          RESTORE_STARTED=$(echo "$STEPS_JSON" | jq -r '.[] | select(.name == "Restore cache") | .started_at')
-          RESTORE_COMPLETED=$(echo "$STEPS_JSON" | jq -r '.[] | select(.name == "Restore cache") | .completed_at')
-
-          SAVE_DURATION=$(($(date -d "$SAVE_COMPLETED" +%s) - $(date -d "$SAVE_STARTED" +%s)))
-          RESTORE_DURATION=$(($(date -d "$RESTORE_COMPLETED" +%s) - $(date -d "$RESTORE_STARTED" +%s)))
-
-          # Compute throughput (MiB/s) — if step completed in <1s, report at least SIZE_MB
-          if [ "$SAVE_DURATION" -gt 0 ]; then
-            SAVE_THROUGHPUT=$((SIZE_MB / SAVE_DURATION))
+          # Compute throughput (MiB/s) using millisecond precision
+          if [ "$SAVE_MS" -gt 0 ]; then
+            SAVE_THROUGHPUT=$(( (SIZE_MB * 1000) / SAVE_MS ))
           else
             SAVE_THROUGHPUT=$SIZE_MB
           fi
 
-          if [ "$RESTORE_DURATION" -gt 0 ]; then
-            RESTORE_THROUGHPUT=$((SIZE_MB / RESTORE_DURATION))
+          if [ "$RESTORE_MS" -gt 0 ]; then
+            RESTORE_THROUGHPUT=$(( (SIZE_MB * 1000) / RESTORE_MS ))
           else
             RESTORE_THROUGHPUT=$SIZE_MB
           fi
 
-          echo "Save: ${SIZE_MB}MB in ${SAVE_DURATION}s (${SAVE_THROUGHPUT} MiB/s)"
-          echo "Restore: ${SIZE_MB}MB in ${RESTORE_DURATION}s (${RESTORE_THROUGHPUT} MiB/s)"
+          # Format durations for display
+          SAVE_DISPLAY=$(echo "scale=2; $SAVE_MS / 1000" | bc)
+          RESTORE_DISPLAY=$(echo "scale=2; $RESTORE_MS / 1000" | bc)
+
+          echo "Save: ${SIZE_MB}MB in ${SAVE_DISPLAY}s (${SAVE_THROUGHPUT} MiB/s)"
+          echo "Restore: ${SIZE_MB}MB in ${RESTORE_DISPLAY}s (${RESTORE_THROUGHPUT} MiB/s)"
 
           # Build summary
           echo "### S3 Cache Throughput" >> "$GITHUB_STEP_SUMMARY"
@@ -256,9 +265,9 @@ jobs:
           echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Payload size | ${SIZE_MB} MB |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Data integrity | ${INTEGRITY} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Save duration | ${SAVE_DURATION}s |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Save duration | ${SAVE_DISPLAY}s |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Save throughput | ${SAVE_THROUGHPUT} MiB/s |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Restore duration | ${RESTORE_DURATION}s |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Restore duration | ${RESTORE_DISPLAY}s |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Restore throughput | ${RESTORE_THROUGHPUT} MiB/s |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Cache backend | ${ACTIONS_CACHE_URL:-GitHub default} |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -281,7 +290,7 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Result: ${RESULT}**" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "_Durations from GitHub API step timestamps (second precision)._" >> "$GITHUB_STEP_SUMMARY"
+          echo "_Durations from wall-clock timing (millisecond precision)._" >> "$GITHUB_STEP_SUMMARY"
 
   # =========================================================================
   # Job 3: Docker Layer Cache
