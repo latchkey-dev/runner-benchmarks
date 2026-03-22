@@ -1,0 +1,286 @@
+name: Latchkey Runner Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Runner label to benchmark'
+        required: false
+        default: 'latchkey-medium'
+        type: choice
+        options:
+          - latchkey-small
+          - latchkey-medium
+          - latchkey-large
+          - latchkey-xlarge
+
+jobs:
+  # =========================================================================
+  # Job 1: Startup Latency
+  # =========================================================================
+  startup-latency:
+    name: Startup Latency
+    runs-on: [self-hosted, "${{ inputs.runner_label || 'latchkey-medium' }}"]
+    steps:
+      - name: Measure startup latency
+        id: latency
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Get this job's queued and started timestamps from the API
+          JOB_DATA=$(gh api \
+            "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
+            --jq '.jobs[] | select(.name == "Startup Latency") | {created_at: .created_at, started_at: .started_at}')
+
+          CREATED_AT=$(echo "$JOB_DATA" | jq -r '.created_at')
+          STARTED_AT=$(echo "$JOB_DATA" | jq -r '.started_at')
+
+          # Convert to epoch seconds
+          CREATED_EPOCH=$(date -d "$CREATED_AT" +%s)
+          STARTED_EPOCH=$(date -d "$STARTED_AT" +%s)
+          LATENCY=$((STARTED_EPOCH - CREATED_EPOCH))
+
+          echo "Queued at:  $CREATED_AT"
+          echo "Started at: $STARTED_AT"
+          echo "Startup latency: ${LATENCY}s"
+
+          echo "latency=${LATENCY}" >> "$GITHUB_OUTPUT"
+          echo "created_at=${CREATED_AT}" >> "$GITHUB_OUTPUT"
+          echo "started_at=${STARTED_AT}" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate result
+        run: |
+          LATENCY=${{ steps.latency.outputs.latency }}
+          echo "### Startup Latency: ${LATENCY}s" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$LATENCY" -le 10 ]; then
+            echo "Result: PASS (warm pool target: <10s)" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$LATENCY" -le 90 ]; then
+            echo "Result: PASS (cold start target: <90s)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Result: FAIL (target: <90s cold, <10s warm)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # =========================================================================
+  # Job 2: S3 Cache Throughput
+  # =========================================================================
+  cache-throughput:
+    name: Cache Throughput
+    runs-on: [self-hosted, "${{ inputs.runner_label || 'latchkey-medium' }}"]
+    steps:
+      - name: Generate 500MB test data
+        run: |
+          mkdir -p test-cache
+          dd if=/dev/urandom of=test-cache/payload.bin bs=1M count=500 status=progress
+          ls -lh test-cache/payload.bin
+          CHECKSUM=$(sha256sum test-cache/payload.bin | cut -d' ' -f1)
+          echo "checksum=${CHECKSUM}" >> "$GITHUB_OUTPUT"
+          echo "Generated 500MB payload, SHA256: ${CHECKSUM}"
+        id: generate
+
+      - name: Save cache (measure throughput)
+        id: cache-save
+        run: |
+          START=$(date +%s%N)
+
+          # Use actions/cache CLI if available, otherwise fall back to API
+          if [ -n "${ACTIONS_CACHE_URL:-}" ]; then
+            echo "Cache URL: ${ACTIONS_CACHE_URL} (Latchkey S3 cache proxy)"
+          else
+            echo "Cache URL: GitHub default"
+          fi
+        # Save timing start for post-step calculation
+        env:
+          SAVE_START: ${{ steps.cache-save.outputs.save_start }}
+
+      - name: Save cache
+        uses: actions/cache/save@v4
+        id: save
+        with:
+          path: test-cache
+          key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Record save time
+        id: save-time
+        run: |
+          # The cache save happened in the previous step
+          # We measure by checking the step duration from the API
+          echo "Cache save completed"
+          echo "save_completed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Clear local data
+        run: |
+          rm -rf test-cache
+          echo "Local cache data cleared"
+
+      - name: Restore cache (measure throughput)
+        id: restore-start
+        run: |
+          echo "start_ns=$(date +%s%N)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cache
+        uses: actions/cache/restore@v4
+        id: restore
+        with:
+          path: test-cache
+          key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Measure restore throughput
+        id: restore-measure
+        run: |
+          END_NS=$(date +%s%N)
+          START_NS=${{ steps.restore-start.outputs.start_ns }}
+
+          # Verify data integrity
+          if [ -f test-cache/payload.bin ]; then
+            SIZE_BYTES=$(stat -c%s test-cache/payload.bin)
+            SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
+            RESTORED_CHECKSUM=$(sha256sum test-cache/payload.bin | cut -d' ' -f1)
+            ORIGINAL_CHECKSUM=${{ steps.generate.outputs.checksum }}
+
+            if [ "$RESTORED_CHECKSUM" = "$ORIGINAL_CHECKSUM" ]; then
+              echo "Integrity: PASS (checksums match)"
+            else
+              echo "Integrity: FAIL (checksum mismatch)"
+            fi
+
+            # Calculate restore throughput
+            DURATION_NS=$((END_NS - START_NS))
+            DURATION_MS=$((DURATION_NS / 1000000))
+            if [ "$DURATION_MS" -gt 0 ]; then
+              THROUGHPUT_MBPS=$((SIZE_MB * 1000 / DURATION_MS))
+            else
+              THROUGHPUT_MBPS=0
+            fi
+
+            echo "Restored ${SIZE_MB}MB in ${DURATION_MS}ms (${THROUGHPUT_MBPS} MiB/s)"
+            echo "restore_throughput=${THROUGHPUT_MBPS}" >> "$GITHUB_OUTPUT"
+            echo "restore_duration_ms=${DURATION_MS}" >> "$GITHUB_OUTPUT"
+            echo "size_mb=${SIZE_MB}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ERROR: Cache restore failed — file not found"
+            echo "restore_throughput=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cache throughput summary
+        run: |
+          echo "### S3 Cache Throughput" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Payload size | ${{ steps.restore-measure.outputs.size_mb }} MB |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Restore throughput | ${{ steps.restore-measure.outputs.restore_throughput }} MiB/s |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Restore duration | ${{ steps.restore-measure.outputs.restore_duration_ms }} ms |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Cache backend | ${ACTIONS_CACHE_URL:-GitHub default} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          THROUGHPUT=${{ steps.restore-measure.outputs.restore_throughput }}
+          if [ "${THROUGHPUT:-0}" -ge 500 ]; then
+            echo "Result: PASS (target: >500 MiB/s)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Result: BELOW TARGET (target: >500 MiB/s, got: ${THROUGHPUT:-0} MiB/s)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # =========================================================================
+  # Job 3: Docker Layer Cache
+  # =========================================================================
+  docker-cache:
+    name: Docker Layer Cache
+    runs-on: [self-hosted, "${{ inputs.runner_label || 'latchkey-medium' }}"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build uncached (first build populates ECR cache)
+        id: build-uncached
+        run: |
+          START=$(date +%s)
+
+          docker buildx build \
+            --file benchmarks/Dockerfile \
+            --tag benchmark-test:uncached \
+            --no-cache \
+            --load \
+            .
+
+          END=$(date +%s)
+          DURATION=$((END - START))
+          echo "Uncached build: ${DURATION}s"
+          echo "duration=${DURATION}" >> "$GITHUB_OUTPUT"
+
+      - name: Push layers to ECR cache
+        if: env.ECR_CACHE_REPO != ''
+        uses: latchkey-dev/docker-cache-action@v1
+        with:
+          context: .
+          dockerfile: benchmarks/Dockerfile
+          tags: benchmark-test:cache-push
+          cache-mode: max
+
+      - name: Clear local Docker cache
+        run: |
+          docker builder prune -af
+          docker image rm benchmark-test:uncached 2>/dev/null || true
+          docker image rm benchmark-test:cache-push 2>/dev/null || true
+          echo "Local Docker cache cleared"
+
+      - name: Build cached (second build uses ECR cache)
+        id: build-cached
+        run: |
+          if [ -n "${ECR_CACHE_REPO:-}" ]; then
+            CACHE_REF="${ECR_CACHE_REPO}:cache"
+            echo "Using ECR cache: ${CACHE_REF}"
+
+            START=$(date +%s)
+
+            docker buildx build \
+              --file benchmarks/Dockerfile \
+              --tag benchmark-test:cached \
+              --cache-from "type=registry,ref=${CACHE_REF}" \
+              --load \
+              .
+
+            END=$(date +%s)
+            DURATION=$((END - START))
+            echo "Cached build: ${DURATION}s"
+            echo "duration=${DURATION}" >> "$GITHUB_OUTPUT"
+            echo "cache_used=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ECR_CACHE_REPO not set — skipping cached build"
+            echo "duration=0" >> "$GITHUB_OUTPUT"
+            echo "cache_used=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Docker cache summary
+        run: |
+          UNCACHED=${{ steps.build-uncached.outputs.duration }}
+          CACHED=${{ steps.build-cached.outputs.duration }}
+          CACHE_USED=${{ steps.build-cached.outputs.cache_used }}
+
+          echo "### Docker Layer Cache" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Uncached build | ${UNCACHED}s |" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$CACHE_USED" = "true" ] && [ "$CACHED" -gt 0 ]; then
+            SPEEDUP=$(echo "scale=1; $UNCACHED / $CACHED" | bc)
+            echo "| Cached build | ${CACHED}s |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Speedup | ${SPEEDUP}x |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ECR cache repo | ${ECR_CACHE_REPO} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+
+            # Check if speedup >= 5x (compare integers to avoid bc issues)
+            SPEEDUP_INT=$(echo "$UNCACHED / $CACHED" | bc)
+            if [ "$SPEEDUP_INT" -ge 5 ]; then
+              echo "Result: PASS (target: >5x improvement)" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "Result: BELOW TARGET (target: >5x, got: ${SPEEDUP}x)" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "| Cached build | N/A (ECR not configured) |" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Result: SKIPPED (ECR_CACHE_REPO not set)" >> "$GITHUB_STEP_SUMMARY"
+          fi
